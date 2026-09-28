@@ -4,7 +4,7 @@ import {
   GitHubConflictError,
   type Env,
 } from './lib/github';
-import { appendChatMessage } from './lib/r2chat';
+import { readChat, appendChatMessage } from './lib/d1chat';
 import { sanitizeText, sanitizeName } from './lib/sanitize';
 
 interface AccessKeyRecord {
@@ -66,8 +66,6 @@ function isAdmin(request: Request, env: Env): boolean {
   const auth = request.headers.get('Authorization') || '';
   const m = auth.match(/^Bearer\s+(.+)$/i);
   if (!m) return false;
-  // Constant-time-ish comparison on length + content. Not perfectly constant
-  // time but adequate for the threat model (admin secret is already strong).
   const provided = m[1];
   const expected = env.ADMIN_SECRET;
   if (provided.length !== expected.length) return false;
@@ -116,8 +114,27 @@ function isValidDateString(s: string): boolean {
   return !isNaN(d.getTime());
 }
 
-// ===== Route handlers =====
+class NotFoundError extends Error {}
 
+// ===== Chat: read (public, cacheable) =====
+async function handleChatRead(env: Env): Promise<Response> {
+  const doc = await readChat(env.DB);
+  // CRITICAL: public + s-maxage=1 makes Cloudflare's edge cache the response
+  // for 1 second. This is what collapses 200 concurrent pollers onto ~1 D1
+  // read per second. Requires the Worker to be on a CUSTOM DOMAIN — the
+  // *.workers.dev subdomain is not cached by Cloudflare.
+  return new Response(JSON.stringify(doc), {
+    status: 200,
+    headers: {
+      'Content-Type': 'application/json',
+      'Cache-Control': 'public, max-age=1, s-maxage=1',
+      'Access-Control-Allow-Origin': env.ALLOWED_ORIGIN,
+      Vary: 'Origin',
+    },
+  });
+}
+
+// ===== Chat: send (public, validated, write) =====
 async function handleChatSend(request: Request, env: Env): Promise<Response> {
   let body: any;
   try {
@@ -126,7 +143,10 @@ async function handleChatSend(request: Request, env: Env): Promise<Response> {
     return errorResponse('Invalid JSON body', 400, env);
   }
 
-  const accessKey = typeof body.access_key === 'string' ? body.access_key.trim().toUpperCase() : '';
+  const accessKey =
+    typeof body.access_key === 'string'
+      ? body.access_key.trim().toUpperCase()
+      : '';
   const studentName = sanitizeName(body.student_name, 50);
   const rawMessage = typeof body.message === 'string' ? body.message : '';
   const message = sanitizeText(rawMessage, 300);
@@ -139,37 +159,38 @@ async function handleChatSend(request: Request, env: Env): Promise<Response> {
   }
 
   // Validate the access key against the current committed file.
-  // GitHub's 5,000 req/hr authenticated limit is orders of magnitude above
-  // realistic chat-send volume at these class sizes.
   const { content: keys } = await getFile(env, ACCESS_KEYS_PATH);
-  if (!Array.isArray(keys)) return errorResponse('Access key store corrupted', 500, env);
+  if (!Array.isArray(keys)) {
+    return errorResponse('Access key store corrupted', 500, env);
+  }
 
   const record = (keys as AccessKeyRecord[]).find(
-    (k) => typeof k.access_key === 'string' && k.access_key.toUpperCase() === accessKey,
+    (k) =>
+      typeof k.access_key === 'string' &&
+      k.access_key.toUpperCase() === accessKey,
   );
   if (!record) return errorResponse('Access key not found', 403, env);
-  if (record.status !== 'active') return errorResponse('Access key revoked', 403, env);
+  if (record.status !== 'active') {
+    return errorResponse('Access key revoked', 403, env);
+  }
 
   const today = new Date().toISOString().slice(0, 10);
-  if (today < record.start_date) return errorResponse('Access period not started', 403, env);
-  if (today > record.end_date) return errorResponse('Access key expired', 403, env);
-
-  try {
-    await appendChatMessage(env.CHAT_BUCKET, {
-      student_name: studentName,
-      message,
-      created_at: Date.now(),
-    });
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : 'Unknown';
-    if (msg.includes('exhausted retries')) {
-      return errorResponse('Chat busy, try again in a moment', 409, env);
-    }
-    throw err;
+  if (today < record.start_date) {
+    return errorResponse('Access period not started', 403, env);
   }
+  if (today > record.end_date) {
+    return errorResponse('Access key expired', 403, env);
+  }
+
+  await appendChatMessage(env.DB, {
+    student_name: studentName,
+    message,
+    created_at: Date.now(),
+  });
   return jsonResponse({ ok: true }, 200, env);
 }
 
+// ===== Chat: admin broadcast (Meet relay) =====
 async function handleBroadcast(request: Request, env: Env): Promise<Response> {
   let body: any;
   try {
@@ -191,23 +212,19 @@ async function handleBroadcast(request: Request, env: Env): Promise<Response> {
     message = MEET_PREFIX + url;
   }
 
-  try {
-    await appendChatMessage(env.CHAT_BUCKET, {
-      student_name: 'System',
-      message,
-      created_at: Date.now(),
-    });
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : 'Unknown';
-    if (msg.includes('exhausted retries')) {
-      return errorResponse('Chat busy, try again in a moment', 409, env);
-    }
-    throw err;
-  }
+  await appendChatMessage(env.DB, {
+    student_name: 'System',
+    message,
+    created_at: Date.now(),
+  });
   return jsonResponse({ ok: true }, 200, env);
 }
 
-async function handleCreateAccessKey(request: Request, env: Env): Promise<Response> {
+// ===== Admin: access keys =====
+async function handleCreateAccessKey(
+  request: Request,
+  env: Env,
+): Promise<Response> {
   let body: any;
   try {
     body = await request.json();
@@ -232,9 +249,15 @@ async function handleCreateAccessKey(request: Request, env: Env): Promise<Respon
   if (!Number.isFinite(amount) || amount < 0) {
     return errorResponse('Invalid amount_paid', 400, env);
   }
-  if (!isValidDateString(startDate)) return errorResponse('Invalid start_date', 400, env);
-  if (!isValidDateString(endDate)) return errorResponse('Invalid end_date', 400, env);
-  if (endDate < startDate) return errorResponse('end_date must be after start_date', 400, env);
+  if (!isValidDateString(startDate)) {
+    return errorResponse('Invalid start_date', 400, env);
+  }
+  if (!isValidDateString(endDate)) {
+    return errorResponse('Invalid end_date', 400, env);
+  }
+  if (endDate < startDate) {
+    return errorResponse('end_date must be after start_date', 400, env);
+  }
 
   const newRecord: AccessKeyRecord = {
     access_key: generateAccessKey(batch),
@@ -250,25 +273,34 @@ async function handleCreateAccessKey(request: Request, env: Env): Promise<Respon
   };
 
   try {
-    await readModifyWrite<AccessKeyRecord[]>(env, ACCESS_KEYS_PATH, (current) => {
-      const list = Array.isArray(current) ? current : [];
-      // Ensure the generated key is unique.
-      let key = newRecord.access_key;
-      let guard = 0;
-      while (list.some((k) => k.access_key === key) && guard < 10) {
-        key = generateAccessKey(batch);
-        guard++;
-      }
-      if (guard >= 10) throw new Error('Could not generate unique access key');
-      newRecord.access_key = key;
-      return {
-        next: [...list, newRecord],
-        commitMessage: `Approve access key for ${newRecord.student_name}`,
-      };
-    });
+    await readModifyWrite<AccessKeyRecord[]>(
+      env,
+      ACCESS_KEYS_PATH,
+      (current) => {
+        const list = Array.isArray(current) ? current : [];
+        let key = newRecord.access_key;
+        let guard = 0;
+        while (list.some((k) => k.access_key === key) && guard < 10) {
+          key = generateAccessKey(batch);
+          guard++;
+        }
+        if (guard >= 10) {
+          throw new Error('Could not generate unique access key');
+        }
+        newRecord.access_key = key;
+        return {
+          next: [...list, newRecord],
+          commitMessage: `Approve access key for ${newRecord.student_name}`,
+        };
+      },
+    );
   } catch (err) {
     if (err instanceof GitHubConflictError) {
-      return errorResponse('Conflict — someone else just wrote the file. Try again.', 409, env);
+      return errorResponse(
+        'Conflict — someone else just wrote the file. Try again.',
+        409,
+        env,
+      );
     }
     throw err;
   }
@@ -281,42 +313,64 @@ async function handleGetAccessKeys(env: Env): Promise<Response> {
   return jsonResponse(content, 200, env);
 }
 
-async function handleRevokeAccessKey(request: Request, env: Env): Promise<Response> {
+async function handleRevokeAccessKey(
+  request: Request,
+  env: Env,
+): Promise<Response> {
   let body: any;
   try {
     body = await request.json();
   } catch {
     return errorResponse('Invalid JSON body', 400, env);
   }
-  const key = typeof body.access_key === 'string' ? body.access_key.trim().toUpperCase() : '';
+  const key =
+    typeof body.access_key === 'string'
+      ? body.access_key.trim().toUpperCase()
+      : '';
   if (!key) return errorResponse('Missing access_key', 400, env);
 
   try {
-    await readModifyWrite<AccessKeyRecord[]>(env, ACCESS_KEYS_PATH, (current) => {
-      const list = Array.isArray(current) ? current : [];
-      const idx = list.findIndex(
-        (k) => typeof k.access_key === 'string' && k.access_key.toUpperCase() === key,
-      );
-      if (idx === -1) throw new NotFoundError('Access key not found');
-      const updated = list.map((k, i) =>
-        i === idx ? { ...k, status: 'revoked' as const } : k,
-      );
-      return {
-        next: updated,
-        commitMessage: `Revoke access key ${key}`,
-      };
-    });
+    await readModifyWrite<AccessKeyRecord[]>(
+      env,
+      ACCESS_KEYS_PATH,
+      (current) => {
+        const list = Array.isArray(current) ? current : [];
+        const idx = list.findIndex(
+          (k) =>
+            typeof k.access_key === 'string' &&
+            k.access_key.toUpperCase() === key,
+        );
+        if (idx === -1) throw new NotFoundError('Access key not found');
+        const updated = list.map((k, i) =>
+          i === idx ? { ...k, status: 'revoked' as const } : k,
+        );
+        return {
+          next: updated,
+          commitMessage: `Revoke access key ${key}`,
+        };
+      },
+    );
   } catch (err) {
-    if (err instanceof NotFoundError) return errorResponse(err.message, 404, env);
+    if (err instanceof NotFoundError) {
+      return errorResponse(err.message, 404, env);
+    }
     if (err instanceof GitHubConflictError) {
-      return errorResponse('Conflict — someone else just wrote the file. Try again.', 409, env);
+      return errorResponse(
+        'Conflict — someone else just wrote the file. Try again.',
+        409,
+        env,
+      );
     }
     throw err;
   }
   return jsonResponse({ ok: true }, 200, env);
 }
 
-async function handleCreateSchedule(request: Request, env: Env): Promise<Response> {
+// ===== Admin: schedule =====
+async function handleCreateSchedule(
+  request: Request,
+  env: Env,
+): Promise<Response> {
   let body: any;
   try {
     body = await request.json();
@@ -360,7 +414,11 @@ async function handleCreateSchedule(request: Request, env: Env): Promise<Respons
     });
   } catch (err) {
     if (err instanceof GitHubConflictError) {
-      return errorResponse('Conflict — someone else just wrote the file. Try again.', 409, env);
+      return errorResponse(
+        'Conflict — someone else just wrote the file. Try again.',
+        409,
+        env,
+      );
     }
     throw err;
   }
@@ -372,7 +430,10 @@ async function handleGetSchedule(env: Env): Promise<Response> {
   return jsonResponse(content, 200, env);
 }
 
-async function handleActivateSchedule(request: Request, env: Env): Promise<Response> {
+async function handleActivateSchedule(
+  request: Request,
+  env: Env,
+): Promise<Response> {
   let body: any;
   try {
     body = await request.json();
@@ -400,16 +461,20 @@ async function handleActivateSchedule(request: Request, env: Env): Promise<Respo
       };
     });
   } catch (err) {
-    if (err instanceof NotFoundError) return errorResponse(err.message, 404, env);
+    if (err instanceof NotFoundError) {
+      return errorResponse(err.message, 404, env);
+    }
     if (err instanceof GitHubConflictError) {
-      return errorResponse('Conflict — someone else just wrote the file. Try again.', 409, env);
+      return errorResponse(
+        'Conflict — someone else just wrote the file. Try again.',
+        409,
+        env,
+      );
     }
     throw err;
   }
   return jsonResponse({ ok: true }, 200, env);
 }
-
-class NotFoundError extends Error {}
 
 // ===== Router =====
 
@@ -419,14 +484,15 @@ export default {
     const path = url.pathname;
     const method = request.method;
 
-    // CORS preflight — respond on every path so misconfigured clients get a
-    // clear failure instead of an opaque browser error.
     if (method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: corsHeaders(env) });
     }
 
     try {
       // ----- Public routes -----
+      if (path === '/api/chat' && method === 'GET') {
+        return await handleChatRead(env);
+      }
       if (path === '/api/chat/send' && method === 'POST') {
         return await handleChatSend(request, env);
       }
@@ -462,7 +528,6 @@ export default {
       return errorResponse('Not found', 404, env);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      // Log server-side, return generic message to client.
       console.error('Unhandled error:', msg);
       return errorResponse(`Server error: ${msg}`, 500, env);
     }

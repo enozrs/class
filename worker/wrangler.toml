@@ -2,15 +2,20 @@ name = "live-classroom-api"
 main = "src/index.ts"
 compatibility_date = "2024-09-23"
 
-[[r2_buckets]]
-binding = "CHAT_BUCKET"
-bucket_name = "live-classroom-chat"
+# R2 binding removed — chat now lives in D1.
+# Delete the [[r2_buckets]] block from your old config.
+
+[[d1_databases]]
+binding = "DB"
+database_name = "live-classroom-chat"
+# Paste the database_id printed by `wrangler d1 create live-classroom-chat`
+database_id = "f6ac473d-f8be-4b8c-948b-45b18e727373"
 
 [vars]
-GITHUB_OWNER = "REPLACE_WITH_YOUR_GITHUB_USERNAME"
+GITHUB_OWNER = "enozrs"
 GITHUB_REPO = "class"
 GITHUB_BRANCH = "main"
-ALLOWED_ORIGIN = "https://REPLACE_WITH_YOUR_PAGES_DOMAIN.pages.dev"
+ALLOWED_ORIGIN = "https://class-srz.pages.dev"
 
 # Secrets (set via `wrangler secret put`, never committed):
 #   GITHUB_TOKEN  — fine-grained PAT, Contents: Read and write on this one repo
