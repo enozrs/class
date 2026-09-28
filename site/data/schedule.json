@@ -1,1 +1,11 @@
-[]
+[
+  {
+    "id": "lesson-1790614217095",
+    "batch_name": "B atch 4",
+    "title": "Class 12: Mars CHanges",
+    "youtube_video_id": "ezoMxP0sBS8",
+    "scheduled_start_time": "2026-09-28T16:50:00.000Z",
+    "is_active": false,
+    "created_at": "2026-09-28T16:50:17.095Z"
+  }
+]
