@@ -135,12 +135,15 @@
 
 <script>
 /* ============================================================
-   CONFIG — fill these in after deploying the Worker + R2 + Pages.
+   CONFIG — fill these in after deploying the Worker + Pages.
    ============================================================ */
-const ACCESS_KEYS_JSON_URL = 'https://REPLACE_WITH_YOUR_PAGES_DOMAIN.pages.dev/data/access-keys.json';
-const SCHEDULE_JSON_URL    = 'https://REPLACE_WITH_YOUR_PAGES_DOMAIN.pages.dev/data/schedule.json';
-const CHAT_JSON_URL        = 'https://REPLACE_WITH_YOUR_R2_DOMAIN/chat.json';
-const WORKER_BASE_URL      = 'https://REPLACE_WITH_YOUR_WORKER.workers.dev';
+const ACCESS_KEYS_JSON_URL = 'https://class-srz.pages.dev/data/access-keys.json';
+const SCHEDULE_JSON_URL    = 'https://class-srz.pages.dev/data/schedule.json';
+const WORKER_BASE_URL      = 'https://live-classroom-api.thesrzone-official.workers.dev/';
+// Chat is now read from WORKER_BASE_URL + '/api/chat'.
+// IMPORTANT: The Worker must be on a CUSTOM DOMAIN (not *.workers.dev) for
+// the 1-second CDN caching to work. If it's on workers.dev, every poll will
+// hit the Worker directly and you'll blow through the 100k/day free tier.
 
 /* ============================================================
    STATE
@@ -148,11 +151,12 @@ const WORKER_BASE_URL      = 'https://REPLACE_WITH_YOUR_WORKER.workers.dev';
 const state = {
   accessKey: null,
   studentName: null,
-  clockOffsetMs: 0,       // serverTime - clientTime, from the Date response header
+  clockOffsetMs: 0,
   activeLesson: null,
   player: null,
   playerReady: false,
-  seenMessageKeys: new Set(),
+  seenMessageIds: new Set(),
+  seenFallbackKeys: new Set(),
   pollHandle: null,
   cooldownTimer: null,
   cooldownUntil: 0,
@@ -240,8 +244,6 @@ $('tap-overlay').addEventListener('click', async () => {
 
   try {
     const res = await fetch(SCHEDULE_JSON_URL, { cache: 'no-store' });
-    // Capture the server Date header for clock-offset correction. This
-    // corrects for students whose phones have wrong system clocks.
     const serverDate = res.headers.get('date');
     if (serverDate) {
       const serverMs = new Date(serverDate).getTime();
@@ -363,15 +365,16 @@ $('btn-resync').addEventListener('click', () => {
 });
 
 /* ============================================================
-   CHAT — polling
+   CHAT — polling (now via Worker → D1, cached at the edge)
    ============================================================ */
 function startChatPolling() {
   if (state.pollHandle) return;
   const tick = async () => {
     try {
-      // No cache-busting query string. We rely on the object's
-      // Cache-Control: max-age=2 so the CDN absorbs most polls.
-      const res = await fetch(CHAT_JSON_URL);
+      // No cache-busting. The Worker returns Cache-Control: public, max-age=1
+      // and Cloudflare's edge caches it, so 200 pollers collapse to ~1 origin
+      // read/sec.
+      const res = await fetch(WORKER_BASE_URL + '/api/chat');
       if (!res.ok) return;
       const doc = await res.json();
       const messages = Array.isArray(doc && doc.messages) ? doc.messages : [];
@@ -386,9 +389,15 @@ function processMessages(messages) {
   for (const msg of messages) {
     if (!msg || typeof msg !== 'object') continue;
     const text = String(msg.message || '');
-    const key = String(msg.created_at) + '|' + String(msg.student_name) + '|' + text;
-    if (state.seenMessageKeys.has(key)) continue;
-    state.seenMessageKeys.add(key);
+    // Prefer the D1 numeric id for dedup; fall back to the composite key.
+    const fallbackKey =
+      String(msg.created_at) + '|' + String(msg.student_name) + '|' + text;
+    const isDup = msg.id != null
+      ? state.seenMessageIds.has(msg.id)
+      : state.seenFallbackKeys.has(fallbackKey);
+    if (isDup) continue;
+    if (msg.id != null) state.seenMessageIds.add(msg.id);
+    else state.seenFallbackKeys.add(fallbackKey);
 
     if (text.startsWith('xxxgooglemeet:')) {
       const url = text.slice('xxxgooglemeet:'.length);
@@ -485,7 +494,6 @@ $('chat-form').addEventListener('submit', async (e) => {
     toast('Network error. Try again.');
   }
 
-  // Only reached on failure path — release the controls so the student can retry.
   btn.disabled = false;
   input.disabled = false;
   btn.textContent = 'Send';
