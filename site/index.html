@@ -1,0 +1,550 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="theme-color" content="#0f172a" />
+<title>Live Classroom</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  .pt-safe { padding-top: env(safe-area-inset-top); }
+  .pb-safe { padding-bottom: env(safe-area-inset-bottom); }
+  html, body { overscroll-behavior: none; -webkit-tap-highlight-color: transparent; }
+  #player-wrap iframe { width: 100%; height: 100%; }
+</style>
+</head>
+<body class="bg-slate-900 text-slate-100 min-h-screen">
+
+<!-- ===== Access Gate ===== -->
+<div id="gate" class="hidden min-h-screen flex items-center justify-center p-4 pt-safe pb-safe">
+  <div class="w-full max-w-sm bg-slate-950 border border-slate-800 rounded-2xl p-6">
+    <h1 class="text-xl font-semibold">Join Live Classroom</h1>
+    <p class="text-sm text-slate-400 mt-1">Enter your access key and name to continue.</p>
+    <form id="gate-form" class="mt-5 space-y-3">
+      <div>
+        <label class="text-xs font-medium text-slate-400" for="gate-key">Access key</label>
+        <input id="gate-key" type="text" autocomplete="off" autocapitalize="characters"
+               class="mt-1 w-full min-h-[44px] px-3 rounded-lg bg-slate-900 border border-slate-700 focus:outline-none focus:border-emerald-500 uppercase tracking-wide"
+               placeholder="B4-K3M9-7QXZ" />
+      </div>
+      <div>
+        <label class="text-xs font-medium text-slate-400" for="gate-name">Your name</label>
+        <input id="gate-name" type="text" autocomplete="name" maxlength="50"
+               class="mt-1 w-full min-h-[44px] px-3 rounded-lg bg-slate-900 border border-slate-700 focus:outline-none focus:border-emerald-500"
+               placeholder="Aayush" />
+      </div>
+      <div id="gate-err" class="hidden text-rose-400 text-sm"></div>
+      <button type="submit"
+              class="w-full min-h-[48px] rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-semibold">
+        Continue
+      </button>
+    </form>
+  </div>
+</div>
+
+<!-- ===== App ===== -->
+<div id="app" class="hidden min-h-screen flex flex-col">
+
+  <header class="px-4 py-3 pt-safe bg-slate-950 border-b border-slate-800 flex items-center justify-between gap-3">
+    <div class="min-w-0">
+      <div class="text-[11px] uppercase tracking-wider text-slate-500">Live Classroom</div>
+      <div id="header-title" class="text-base font-semibold truncate">—</div>
+    </div>
+    <button id="btn-resync"
+            class="shrink-0 min-h-[44px] px-3 rounded-md bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium">
+      Re-sync
+    </button>
+  </header>
+
+  <main class="relative bg-black w-full" style="aspect-ratio:16/9; max-height:60vh;">
+    <div id="player-wrap" class="absolute inset-0"></div>
+    <!-- Transparent interaction blocker: student cannot pause/scrub/open YouTube UI. -->
+    <div class="absolute inset-0 z-10" style="pointer-events:auto;" aria-hidden="true"></div>
+    <!-- Countdown overlay (before scheduled start). -->
+    <div id="countdown-overlay" class="hidden absolute inset-0 z-20 bg-black/90 flex items-center justify-center text-center px-6">
+      <div>
+        <div id="countdown-text" class="text-2xl font-semibold">Class starts in 0m 0s</div>
+        <div class="text-sm text-slate-400 mt-2">Video will play automatically.</div>
+      </div>
+    </div>
+    <!-- Boot status / error. -->
+    <div id="boot-status" class="hidden absolute inset-0 z-30 bg-black/90 flex items-center justify-center text-center px-6 text-slate-200 text-sm"></div>
+  </main>
+
+  <section class="flex-1 overflow-y-auto p-4">
+    <div class="text-sm text-slate-400 leading-relaxed">
+      You are watching the live lesson. If the video falls behind, tap <span class="text-slate-200 font-medium">Re-sync</span>.
+      Open chat with the button below.
+    </div>
+  </section>
+
+  <!-- Chat launcher -->
+  <button id="chat-toggle"
+          class="fixed right-4 bottom-6 z-30 min-w-[56px] min-h-[56px] pb-safe rounded-full bg-emerald-600 hover:bg-emerald-500 text-white font-semibold shadow-xl">
+    Chat
+  </button>
+
+  <!-- Chat panel (bottom sheet). -->
+  <aside id="chat-panel"
+         class="hidden fixed inset-x-0 bottom-0 z-40 bg-slate-950 border-t border-slate-800 rounded-t-2xl max-h-[75vh] flex flex-col pb-safe">
+    <div class="px-4 py-3 flex items-center justify-between border-b border-slate-800">
+      <div class="font-semibold">Live Chat</div>
+      <button id="chat-close" class="w-11 h-11 rounded-full bg-slate-800 hover:bg-slate-700 flex items-center justify-center text-xl" aria-label="Close chat">×</button>
+    </div>
+    <ul id="chat-list" class="flex-1 overflow-y-auto p-3 space-y-2"></ul>
+    <form id="chat-form" class="p-3 border-t border-slate-800 flex gap-2">
+      <input id="chat-input" type="text" maxlength="300" autocomplete="off"
+             placeholder="Type a message…"
+             class="flex-1 min-h-[44px] px-3 rounded-lg bg-slate-900 border border-slate-700 focus:outline-none focus:border-emerald-500" />
+      <button id="chat-send" type="submit"
+              class="min-h-[44px] px-4 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-medium">
+        Send
+      </button>
+    </form>
+  </aside>
+
+  <!-- Tap to join overlay -->
+  <div id="tap-overlay" class="hidden fixed inset-0 z-40 bg-slate-950/98 backdrop-blur flex flex-col items-center justify-center p-6 pt-safe pb-safe">
+    <div class="text-center max-w-sm">
+      <div class="text-2xl font-semibold">Ready when you are</div>
+      <p class="text-sm text-slate-400 mt-2">Tap below to enter the live classroom.</p>
+      <div class="mt-6 text-5xl animate-pulse">▶</div>
+      <div class="mt-6 text-xs uppercase tracking-widest text-emerald-400">Tap anywhere to join</div>
+    </div>
+  </div>
+
+  <!-- Meet modal -->
+  <div id="meet-modal" class="hidden fixed inset-0 z-50 bg-black/85 backdrop-blur flex items-center justify-center p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6 max-w-sm w-full">
+      <div class="flex items-start justify-between gap-3">
+        <div class="text-lg font-semibold leading-tight">Teacher started a live Q&amp;A</div>
+        <button id="meet-dismiss" class="shrink-0 w-9 h-9 rounded-full bg-slate-800 hover:bg-slate-700 flex items-center justify-center text-lg" aria-label="Dismiss">×</button>
+      </div>
+      <p class="text-sm text-slate-400 mt-3">Join Google Meet to ask questions directly.</p>
+      <button id="meet-join"
+              class="mt-5 w-full min-h-[48px] rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-semibold">
+        Join Google Meet
+      </button>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div id="toast" class="hidden fixed bottom-6 left-1/2 -translate-x-1/2 z-[60] px-4 py-2 rounded-lg bg-slate-800 border border-slate-700 text-sm shadow-xl"></div>
+
+</div>
+
+<script>
+/* ============================================================
+   CONFIG — fill these in after deploying the Worker + R2 + Pages.
+   ============================================================ */
+const ACCESS_KEYS_JSON_URL = 'https://REPLACE_WITH_YOUR_PAGES_DOMAIN.pages.dev/data/access-keys.json';
+const SCHEDULE_JSON_URL    = 'https://REPLACE_WITH_YOUR_PAGES_DOMAIN.pages.dev/data/schedule.json';
+const CHAT_JSON_URL        = 'https://REPLACE_WITH_YOUR_R2_DOMAIN/chat.json';
+const WORKER_BASE_URL      = 'https://REPLACE_WITH_YOUR_WORKER.workers.dev';
+
+/* ============================================================
+   STATE
+   ============================================================ */
+const state = {
+  accessKey: null,
+  studentName: null,
+  clockOffsetMs: 0,       // serverTime - clientTime, from the Date response header
+  activeLesson: null,
+  player: null,
+  playerReady: false,
+  seenMessageKeys: new Set(),
+  pollHandle: null,
+  cooldownTimer: null,
+  cooldownUntil: 0,
+  countdownInterval: null,
+};
+
+const $ = (id) => document.getElementById(id);
+
+/* ============================================================
+   BOOT
+   ============================================================ */
+window.addEventListener('DOMContentLoaded', () => {
+  const raw = sessionStorage.getItem('lc_session');
+  if (raw) {
+    try {
+      const s = JSON.parse(raw);
+      if (s && s.access_key && s.student_name) {
+        state.accessKey = s.access_key;
+        state.studentName = s.student_name;
+        enterApp();
+        return;
+      }
+    } catch { /* fall through to gate */ }
+  }
+  $('gate').classList.remove('hidden');
+});
+
+/* ============================================================
+   ACCESS GATE
+   ============================================================ */
+$('gate-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const key = $('gate-key').value.trim().toUpperCase();
+  const name = $('gate-name').value.trim();
+  $('gate-err').classList.add('hidden');
+
+  if (!key || !name) return showGateError('Enter both access key and your name.');
+
+  try {
+    const res = await fetch(ACCESS_KEYS_JSON_URL, { cache: 'no-store' });
+    if (!res.ok) throw new Error('Could not load access list.');
+    const keys = await res.json();
+    if (!Array.isArray(keys)) throw new Error('Access list unavailable.');
+
+    const rec = keys.find(k => k && typeof k.access_key === 'string' &&
+                               k.access_key.toUpperCase() === key);
+    if (!rec) return showGateError('Access key not found.');
+    if (rec.status === 'revoked') return showGateError('Access key has been revoked.');
+
+    const today = new Date().toISOString().slice(0, 10);
+    if (today < rec.start_date) return showGateError('Access period has not started yet.');
+    if (today > rec.end_date) return showGateError('Access key has expired.');
+
+    sessionStorage.setItem('lc_session', JSON.stringify({
+      access_key: key,
+      student_name: name,
+    }));
+    state.accessKey = key;
+    state.studentName = name;
+    enterApp();
+  } catch (err) {
+    showGateError(err && err.message ? err.message : 'Something went wrong.');
+  }
+});
+
+function showGateError(msg) {
+  const el = $('gate-err');
+  el.textContent = msg;
+  el.classList.remove('hidden');
+}
+
+function enterApp() {
+  $('gate').classList.add('hidden');
+  $('app').classList.remove('hidden');
+  $('tap-overlay').classList.remove('hidden');
+}
+
+/* ============================================================
+   TAP TO JOIN
+   ============================================================ */
+$('tap-overlay').addEventListener('click', async () => {
+  $('tap-overlay').classList.add('hidden');
+  $('boot-status').classList.remove('hidden');
+  $('boot-status').textContent = 'Loading lesson…';
+
+  try {
+    const res = await fetch(SCHEDULE_JSON_URL, { cache: 'no-store' });
+    // Capture the server Date header for clock-offset correction. This
+    // corrects for students whose phones have wrong system clocks.
+    const serverDate = res.headers.get('date');
+    if (serverDate) {
+      const serverMs = new Date(serverDate).getTime();
+      if (!isNaN(serverMs)) state.clockOffsetMs = serverMs - Date.now();
+    }
+
+    const schedule = await res.json();
+    const active = Array.isArray(schedule)
+      ? schedule.find(s => s && s.is_active === true)
+      : null;
+
+    if (!active) {
+      $('boot-status').textContent = 'No active lesson scheduled yet. Please wait for the teacher.';
+      return;
+    }
+
+    state.activeLesson = active;
+    $('header-title').textContent = active.title || 'Live Lesson';
+    $('boot-status').textContent = 'Preparing video…';
+
+    await ensureYouTubeApi();
+    createPlayer(active);
+    startChatPolling();
+  } catch (err) {
+    $('boot-status').textContent = 'Could not load lesson: ' + (err && err.message ? err.message : 'unknown error');
+  }
+});
+
+/* ============================================================
+   YOUTUBE PLAYER
+   ============================================================ */
+function ensureYouTubeApi() {
+  return new Promise((resolve) => {
+    if (window.YT && window.YT.Player) return resolve();
+    window.onYouTubeIframeAPIReady = () => resolve();
+    const s = document.createElement('script');
+    s.src = 'https://www.youtube.com/iframe_api';
+    document.head.appendChild(s);
+  });
+}
+
+function createPlayer(lesson) {
+  const wrap = $('player-wrap');
+  wrap.innerHTML = '';
+  const div = document.createElement('div');
+  div.id = 'yt-player';
+  wrap.appendChild(div);
+
+  state.player = new YT.Player('yt-player', {
+    videoId: lesson.youtube_video_id,
+    playerVars: {
+      autoplay: 1,
+      controls: 0,
+      disablekb: 1,
+      modestbranding: 1,
+      rel: 0,
+      fs: 0,
+      playsinline: 1,
+      iv_load_policy: 3,
+    },
+    events: {
+      onReady: () => {
+        state.playerReady = true;
+        $('boot-status').classList.add('hidden');
+        beginPlayback();
+      },
+    },
+  });
+}
+
+function beginPlayback() {
+  const startMs = new Date(state.activeLesson.scheduled_start_time).getTime();
+  const elapsed = (Date.now() + state.clockOffsetMs - startMs) / 1000;
+  if (elapsed < 0) {
+    startCountdown(-elapsed);
+  } else {
+    seekToElapsed();
+  }
+}
+
+function seekToElapsed() {
+  if (!state.playerReady || !state.player) return;
+  const startMs = new Date(state.activeLesson.scheduled_start_time).getTime();
+  const elapsed = (Date.now() + state.clockOffsetMs - startMs) / 1000;
+  const target = Math.max(0, elapsed);
+  try {
+    state.player.seekTo(target, true);
+    state.player.playVideo();
+  } catch { /* ignore */ }
+}
+
+function startCountdown(secondsRemaining) {
+  const overlay = $('countdown-overlay');
+  overlay.classList.remove('hidden');
+  let remaining = Math.floor(secondsRemaining);
+
+  const tick = () => {
+    if (remaining <= 0) {
+      overlay.classList.add('hidden');
+      if (state.countdownInterval) {
+        clearInterval(state.countdownInterval);
+        state.countdownInterval = null;
+      }
+      seekToElapsed();
+      return;
+    }
+    const m = Math.floor(remaining / 60);
+    const s = remaining % 60;
+    $('countdown-text').textContent = 'Class starts in ' + m + 'm ' + s + 's';
+    remaining -= 1;
+  };
+  tick();
+  state.countdownInterval = setInterval(tick, 1000);
+}
+
+$('btn-resync').addEventListener('click', () => {
+  seekToElapsed();
+  toast('Re-synced to live position.');
+});
+
+/* ============================================================
+   CHAT — polling
+   ============================================================ */
+function startChatPolling() {
+  if (state.pollHandle) return;
+  const tick = async () => {
+    try {
+      // No cache-busting query string. We rely on the object's
+      // Cache-Control: max-age=2 so the CDN absorbs most polls.
+      const res = await fetch(CHAT_JSON_URL);
+      if (!res.ok) return;
+      const doc = await res.json();
+      const messages = Array.isArray(doc && doc.messages) ? doc.messages : [];
+      processMessages(messages);
+    } catch { /* network blip — next tick will recover */ }
+  };
+  tick();
+  state.pollHandle = setInterval(tick, 3000);
+}
+
+function processMessages(messages) {
+  for (const msg of messages) {
+    if (!msg || typeof msg !== 'object') continue;
+    const text = String(msg.message || '');
+    const key = String(msg.created_at) + '|' + String(msg.student_name) + '|' + text;
+    if (state.seenMessageKeys.has(key)) continue;
+    state.seenMessageKeys.add(key);
+
+    if (text.startsWith('xxxgooglemeet:')) {
+      const url = text.slice('xxxgooglemeet:'.length);
+      openMeetModal(url);
+      continue;
+    }
+    if (text === 'xxxgooglemeet-end') {
+      closeMeetModal();
+      continue;
+    }
+    appendBubble(msg);
+  }
+  pruneBubbles();
+}
+
+function appendBubble(msg) {
+  const list = $('chat-list');
+  const li = document.createElement('li');
+  li.className = 'flex flex-col gap-0.5 px-3 py-2 rounded-lg bg-slate-800';
+
+  const nameEl = document.createElement('span');
+  nameEl.className = 'text-xs font-semibold text-emerald-400';
+  nameEl.textContent = String(msg.student_name || 'Unknown');
+
+  const textEl = document.createElement('span');
+  textEl.className = 'text-sm text-slate-100 break-words whitespace-pre-wrap';
+  textEl.textContent = String(msg.message || '');
+
+  const timeEl = document.createElement('span');
+  timeEl.className = 'text-[10px] text-slate-500';
+  const d = new Date(Number(msg.created_at) || Date.now());
+  timeEl.textContent = isNaN(d.getTime()) ? '' : d.toLocaleTimeString();
+
+  li.appendChild(nameEl);
+  li.appendChild(textEl);
+  li.appendChild(timeEl);
+  list.appendChild(li);
+  list.scrollTop = list.scrollHeight;
+}
+
+function pruneBubbles() {
+  const list = $('chat-list');
+  while (list.children.length > 20) list.removeChild(list.firstChild);
+}
+
+$('chat-toggle').addEventListener('click', () => {
+  $('chat-panel').classList.remove('hidden');
+});
+$('chat-close').addEventListener('click', () => {
+  $('chat-panel').classList.add('hidden');
+});
+
+/* ============================================================
+   CHAT — send with 4s cooldown
+   ============================================================ */
+$('chat-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const input = $('chat-input');
+  const btn = $('chat-send');
+  const text = input.value.trim();
+
+  if (!text) return;
+  if (Date.now() < state.cooldownUntil) return;
+  if (!state.accessKey || !state.studentName) {
+    toast('Please rejoin to send messages.');
+    return;
+  }
+
+  btn.disabled = true;
+  input.disabled = true;
+  btn.textContent = 'Sending…';
+
+  try {
+    const res = await fetch(WORKER_BASE_URL + '/api/chat/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        access_key: state.accessKey,
+        student_name: state.studentName,
+        message: text,
+      }),
+    });
+
+    if (res.ok) {
+      input.value = '';
+      startCooldown(4);
+      return;
+    }
+
+    let errMsg = 'Message failed.';
+    try { const j = await res.json(); if (j && j.error) errMsg = j.error; } catch {}
+    toast(errMsg);
+  } catch {
+    toast('Network error. Try again.');
+  }
+
+  // Only reached on failure path — release the controls so the student can retry.
+  btn.disabled = false;
+  input.disabled = false;
+  btn.textContent = 'Send';
+});
+
+function startCooldown(seconds) {
+  const input = $('chat-input');
+  const btn = $('chat-send');
+  state.cooldownUntil = Date.now() + seconds * 1000;
+  let remaining = seconds;
+
+  btn.disabled = true;
+  input.disabled = true;
+  btn.textContent = 'Wait ' + remaining + 's…';
+
+  state.cooldownTimer = setInterval(() => {
+    remaining -= 1;
+    if (remaining <= 0) {
+      clearInterval(state.cooldownTimer);
+      state.cooldownTimer = null;
+      btn.disabled = false;
+      input.disabled = false;
+      btn.textContent = 'Send';
+      state.cooldownUntil = 0;
+      return;
+    }
+    btn.textContent = 'Wait ' + remaining + 's…';
+  }, 1000);
+}
+
+/* ============================================================
+   MEET MODAL
+   ============================================================ */
+let currentMeetUrl = null;
+
+function openMeetModal(url) {
+  currentMeetUrl = url;
+  $('meet-modal').classList.remove('hidden');
+}
+function closeMeetModal() {
+  currentMeetUrl = null;
+  $('meet-modal').classList.add('hidden');
+}
+$('meet-join').addEventListener('click', () => {
+  if (currentMeetUrl) window.open(currentMeetUrl, '_blank', 'noopener,noreferrer');
+});
+$('meet-dismiss').addEventListener('click', closeMeetModal);
+
+/* ============================================================
+   TOAST
+   ============================================================ */
+let toastTimer = null;
+function toast(msg) {
+  const el = $('toast');
+  el.textContent = msg;
+  el.classList.remove('hidden');
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.add('hidden'), 3000);
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,17 @@
+name = "live-classroom-api"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+
+[[r2_buckets]]
+binding = "CHAT_BUCKET"
+bucket_name = "live-classroom-chat"
+
+[vars]
+GITHUB_OWNER = "REPLACE_WITH_YOUR_GITHUB_USERNAME"
+GITHUB_REPO = "class"
+GITHUB_BRANCH = "main"
+ALLOWED_ORIGIN = "https://REPLACE_WITH_YOUR_PAGES_DOMAIN.pages.dev"
+
+# Secrets (set via `wrangler secret put`, never committed):
+#   GITHUB_TOKEN  — fine-grained PAT, Contents: Read and write on this one repo
+#   ADMIN_SECRET  — password gating all /api/admin/* routes
